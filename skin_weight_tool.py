@@ -2,11 +2,13 @@
 """
 Skin Weight 複製/貼上工具
 支援 Python 2/3，Maya 2020+，PySide2 UI
+權重讀寫使用 OpenMaya API 2 批次操作以提升效能
 """
 
 from __future__ import print_function, division
 import maya.cmds as cmds
-import maya.mel as mel
+import maya.api.OpenMaya as om2
+import maya.api.OpenMayaAnim as oma2
 
 from PySide2 import QtWidgets, QtCore
 
@@ -14,83 +16,131 @@ from PySide2 import QtWidgets, QtCore
 _weight_data = {}
 
 
+# ---------------------------------------------------------------------------
+# 核心工具函式
+# ---------------------------------------------------------------------------
+
 def get_skin_cluster(mesh):
-    """取得 mesh 上的 skinCluster 節點名稱"""
-    history = cmds.listHistory(mesh, interestLevel=1) or []
-    for node in history:
-        if cmds.nodeType(node) == 'skinCluster':
-            return node
-    return None
+    """透過 API 取得 mesh 上的 skinCluster MObject"""
+    sel = om2.MSelectionList()
+    sel.add(mesh)
+    dag = sel.getDagPath(0)
+
+    # 取得 mesh shape
+    dag.extendToShape()
+
+    # 走訪 DG history 找 skinCluster
+    it = om2.MItDependencyGraph(
+        dag.node(),
+        om2.MFn.kSkinClusterFilter,
+        om2.MItDependencyGraph.kUpstream,
+    )
+    if it.isDone():
+        return None
+    return it.currentNode()
 
 
 def copy_weights(mesh):
-    """複製指定 mesh 的 skin weight 資料"""
+    """使用 om2 批次讀取 skin weight，存入全域暫存"""
     global _weight_data
     _weight_data = {}
 
-    skin = get_skin_cluster(mesh)
-    if not skin:
+    skin_node = get_skin_cluster(mesh)
+    if skin_node is None:
         raise RuntimeError(u'{} 上找不到 skinCluster'.format(mesh))
 
-    # 取得所有 influence joint
-    influences = cmds.skinCluster(skin, query=True, influence=True)
+    skin_fn = oma2.MFnSkinCluster(skin_node)
 
-    # 取得頂點數量
+    # 取得 mesh 的 dag path 與所有頂點 component
+    sel = om2.MSelectionList()
+    sel.add(mesh)
+    dag = sel.getDagPath(0)
+    dag.extendToShape()
+
+    vtx_comp = om2.MFnSingleIndexedComponent()
+    all_vtx = vtx_comp.create(om2.MFn.kMeshVertComponent)
     vertex_count = cmds.polyEvaluate(mesh, vertex=True)
+    vtx_comp.addElements(list(range(vertex_count)))
 
-    # 逐頂點取得 weight
-    weights = {}
-    for i in range(vertex_count):
-        vtx = '{}.vtx[{}]'.format(mesh, i)
-        vtx_weights = {}
-        for inf in influences:
-            w = cmds.skinPercent(skin, vtx, transform=inf, query=True)
-            if w > 0.0001:
-                vtx_weights[inf] = w
-        weights[i] = vtx_weights
+    # 一次性批次取得所有頂點的全部 weight
+    weights, influence_count = skin_fn.getWeights(dag, all_vtx)
+
+    # 取得 influence joint 名稱
+    inf_paths = skin_fn.influenceObjects()
+    influences = [p.fullPathName() for p in inf_paths]
 
     _weight_data = {
         'mesh': mesh,
         'influences': influences,
-        'weights': weights,
+        'weights': weights,           # om2.MDoubleArray，長度 = 頂點數 * influence 數
+        'influence_count': influence_count,
         'vertex_count': vertex_count,
     }
-    return len(weights)
+    return vertex_count
 
 
 def paste_weights(target_mesh):
-    """將暫存的 weight 貼到目標 mesh"""
+    """使用 om2 批次寫入 skin weight 到目標 mesh"""
     global _weight_data
 
     if not _weight_data:
         raise RuntimeError(u'請先複製 weight')
 
-    skin = get_skin_cluster(target_mesh)
-    if not skin:
+    skin_node = get_skin_cluster(target_mesh)
+    if skin_node is None:
         raise RuntimeError(u'{} 上找不到 skinCluster'.format(target_mesh))
 
-    src_count = _weight_data['vertex_count']
     tgt_count = cmds.polyEvaluate(target_mesh, vertex=True)
+    src_count = _weight_data['vertex_count']
 
     if src_count != tgt_count:
         raise RuntimeError(
             u'頂點數不符：來源 {} 個，目標 {} 個'.format(src_count, tgt_count)
         )
 
-    weights = _weight_data['weights']
+    skin_fn = oma2.MFnSkinCluster(skin_node)
 
-    # 逐頂點套用 weight
-    for i, vtx_weights in weights.items():
-        if not vtx_weights:
+    sel = om2.MSelectionList()
+    sel.add(target_mesh)
+    dag = sel.getDagPath(0)
+    dag.extendToShape()
+
+    vtx_comp = om2.MFnSingleIndexedComponent()
+    all_vtx = vtx_comp.create(om2.MFn.kMeshVertComponent)
+    vtx_comp.addElements(list(range(tgt_count)))
+
+    # 比對 influence 順序，建立來源到目標的 index 對應
+    tgt_inf_paths = skin_fn.influenceObjects()
+    tgt_influences = [p.fullPathName() for p in tgt_inf_paths]
+    src_influences = _weight_data['influences']
+    src_inf_count = _weight_data['influence_count']
+    src_weights = _weight_data['weights']
+
+    # 建立重新排列後的 weight 陣列
+    tgt_inf_count = len(tgt_influences)
+    new_weights = om2.MDoubleArray(tgt_count * tgt_inf_count, 0.0)
+
+    # 建立來源 influence 名稱到 index 的查詢表
+    src_inf_index = {name: i for i, name in enumerate(src_influences)}
+
+    for tgt_i, tgt_inf in enumerate(tgt_influences):
+        src_i = src_inf_index.get(tgt_inf, None)
+        if src_i is None:
             continue
-        vtx = '{}.vtx[{}]'.format(target_mesh, i)
-        transform_value = [
-            (inf, w) for inf, w in vtx_weights.items()
-        ]
-        cmds.skinPercent(skin, vtx, transformValue=transform_value)
+        for vtx in range(tgt_count):
+            new_weights[vtx * tgt_inf_count + tgt_i] = \
+                src_weights[vtx * src_inf_count + src_i]
+
+    # 一次性批次寫入所有 weight
+    all_inf_indices = om2.MIntArray(list(range(tgt_inf_count)))
+    skin_fn.setWeights(dag, all_vtx, all_inf_indices, new_weights, normalize=True)
 
     return tgt_count
 
+
+# ---------------------------------------------------------------------------
+# PySide2 UI
+# ---------------------------------------------------------------------------
 
 class SkinWeightTool(QtWidgets.QDialog):
     """Skin Weight 複製貼上工具主視窗"""
@@ -100,57 +150,69 @@ class SkinWeightTool(QtWidgets.QDialog):
         self.setWindowTitle(u'Skin Weight 工具')
         self.setMinimumWidth(320)
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
-        self._build_ui()
 
-    def _build_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.setContentsMargins(12, 12, 12, 12)
+        self.create_widget()
+        self.create_layout()
+        self.create_connect()
 
-        # --- 來源區 ---
-        src_group = QtWidgets.QGroupBox(u'來源 Mesh')
-        src_layout = QtWidgets.QHBoxLayout(src_group)
-
+    def create_widget(self):
+        """建立所有 UI 元件"""
+        # 來源區
+        self.src_group = QtWidgets.QGroupBox(u'來源 Mesh')
         self.src_line = QtWidgets.QLineEdit()
         self.src_line.setPlaceholderText(u'選取 mesh 後點擊取得')
-        src_layout.addWidget(self.src_line)
+        self.src_pick_btn = QtWidgets.QPushButton(u'取得選取')
 
-        src_pick_btn = QtWidgets.QPushButton(u'取得選取')
-        src_pick_btn.clicked.connect(self._pick_source)
-        src_layout.addWidget(src_pick_btn)
-
-        layout.addWidget(src_group)
-
-        # --- 複製按鈕 ---
+        # 複製按鈕
         self.copy_btn = QtWidgets.QPushButton(u'複製 Weight')
         self.copy_btn.setFixedHeight(32)
-        self.copy_btn.clicked.connect(self._copy)
-        layout.addWidget(self.copy_btn)
 
-        # --- 目標區 ---
-        tgt_group = QtWidgets.QGroupBox(u'目標 Mesh')
-        tgt_layout = QtWidgets.QHBoxLayout(tgt_group)
-
+        # 目標區
+        self.tgt_group = QtWidgets.QGroupBox(u'目標 Mesh')
         self.tgt_line = QtWidgets.QLineEdit()
         self.tgt_line.setPlaceholderText(u'選取 mesh 後點擊取得')
-        tgt_layout.addWidget(self.tgt_line)
+        self.tgt_pick_btn = QtWidgets.QPushButton(u'取得選取')
 
-        tgt_pick_btn = QtWidgets.QPushButton(u'取得選取')
-        tgt_pick_btn.clicked.connect(self._pick_target)
-        tgt_layout.addWidget(tgt_pick_btn)
-
-        layout.addWidget(tgt_group)
-
-        # --- 貼上按鈕 ---
+        # 貼上按鈕
         self.paste_btn = QtWidgets.QPushButton(u'貼上 Weight')
         self.paste_btn.setFixedHeight(32)
-        self.paste_btn.clicked.connect(self._paste)
-        layout.addWidget(self.paste_btn)
 
-        # --- 狀態列 ---
+        # 狀態列
         self.status_label = QtWidgets.QLabel(u'就緒')
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.status_label)
+
+    def create_layout(self):
+        """建立版面配置"""
+        # 來源群組內部
+        src_inner = QtWidgets.QHBoxLayout(self.src_group)
+        src_inner.addWidget(self.src_line)
+        src_inner.addWidget(self.src_pick_btn)
+
+        # 目標群組內部
+        tgt_inner = QtWidgets.QHBoxLayout(self.tgt_group)
+        tgt_inner.addWidget(self.tgt_line)
+        tgt_inner.addWidget(self.tgt_pick_btn)
+
+        # 主版面
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.addWidget(self.src_group)
+        main_layout.addWidget(self.copy_btn)
+        main_layout.addWidget(self.tgt_group)
+        main_layout.addWidget(self.paste_btn)
+        main_layout.addWidget(self.status_label)
+
+    def create_connect(self):
+        """建立所有訊號連接"""
+        self.src_pick_btn.clicked.connect(self._pick_source)
+        self.copy_btn.clicked.connect(self._copy)
+        self.tgt_pick_btn.clicked.connect(self._pick_target)
+        self.paste_btn.clicked.connect(self._paste)
+
+    # -----------------------------------------------------------------------
+    # 事件處理
+    # -----------------------------------------------------------------------
 
     def _pick_source(self):
         """取得目前選取的 mesh 填入來源欄位"""
@@ -199,7 +261,10 @@ class SkinWeightTool(QtWidgets.QDialog):
         self.status_label.setText(msg)
 
 
-# 全域視窗實例，避免重複開啟
+# ---------------------------------------------------------------------------
+# 開啟視窗
+# ---------------------------------------------------------------------------
+
 _tool_window = None
 
 
@@ -207,7 +272,6 @@ def show():
     """開啟工具視窗"""
     global _tool_window
 
-    # 取得 Maya 主視窗作為 parent
     try:
         from shiboken2 import wrapInstance
         import maya.OpenMayaUI as omui
@@ -216,7 +280,6 @@ def show():
     except Exception:
         parent = None
 
-    # 若視窗已存在則直接顯示
     if _tool_window is not None:
         try:
             _tool_window.show()
